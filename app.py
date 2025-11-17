@@ -10,55 +10,36 @@ import requests
 from PIL import Image
 from difflib import get_close_matches
 
-# --------------------------
+
 # LangChain y vectores
-# --------------------------
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain.llms import HuggingFacePipeline
 
+
 from transformers import pipeline
 from difflib import get_close_matches
 
-# --------------------------
+
 # Archivo con información de medicamentos
-# --------------------------
 MEDS_FILE = 'medicamentos.json'
 with open(MEDS_FILE, encoding="utf-8") as f:
     meds = json.load(f)
 
-# --------------------------
 # Embeddings y vector store
-# --------------------------
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-##vectorstore = FAISS.from_texts(texts, embedding_model)
+
 # Solo nombres de los medicamentos en embeddings
 texts = list(meds.keys())
 vectorstore = FAISS.from_texts(texts, embedding_model)
 
 
-# --------------------------
-# LLM para generar respuestas
-# --------------------------
-hf_pipeline = pipeline("text-generation", model="tiiuae/falcon-7b-instruct", max_new_tokens=128)
-llm = HuggingFacePipeline(pipeline=hf_pipeline)
-
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=vectorstore.as_retriever(),
-    chain_type="stuff"  # concatena los textos recuperados
-)
-
-# --------------------------
 # Flask app
-# --------------------------
 app = Flask(__name__)
 
 
-# --------------------------
 # Endpoint texto
-# --------------------------
 @app.route('/predict_text', methods=['POST'])
 def predict_text():
     data = request.get_json()
@@ -73,8 +54,10 @@ def predict_text():
         resultados = []
         nombres_agregados = set()
 
-        # Buscar top 10 más similares y luego tomar 3
-        docs = vectorstore.similarity_search(pregunta, k=10)
+        med_name = clean_med_name(pregunta)
+
+        # Buscar top 3 similares usando FAISS
+        docs = vectorstore.similarity_search(med_name, k=3)  
 
         for d in docs:
             nombre = d.page_content.strip()
@@ -100,43 +83,7 @@ def predict_text():
         return jsonify({'error': str(e)}), 500
 
 
-
-
-# ===============================================================
-#  FUNCIÓN PROCESAR TEXTO
-# ===============================================================
-def procesar_texto(pregunta: str):
-    """
-    Recibe texto como: "para qué sirve la acetaminofén"
-    Devuelve:
-        {
-           "medication": "Acetaminofen",
-           "informacion": "Texto..."
-        }
-    """
-
-    # 1. Detectar nombre del medicamento usando embeddings
-    docs = vectorstore.similarity_search(pregunta, k=1)
-    if not docs:
-        return {
-            "medication": "No identificado",
-            "informacion": "No se encontró información relevante."
-        }
-
-    resultados = []
-    for d in docs:
-        nombre = d.page_content.strip()
-        info = meds.get(nombre, "Información no encontrada")
-        resultados.append({
-            "medication": nombre,
-            "informacion": info
-        })
-
-    return {"resultados": resultados}
-
-# --------------------------
 # Endpoint archivo
-# --------------------------
 @app.route('/predict_file', methods=['POST'])
 def predict_file():
     try:
@@ -168,7 +115,7 @@ def predict_file():
         nombres_agregados.add(med_name.lower())
 
         # Buscar top 3 similares usando FAISS
-        docs = vectorstore.similarity_search(med_name, k=10)  # buscar varios para filtrar luego
+        docs = vectorstore.similarity_search(med_name, k=3)  
 
         for d in docs:
             nombre = d.page_content.strip()
@@ -180,20 +127,14 @@ def predict_file():
                 })
                 nombres_agregados.add(nombre.lower())
             if len(resultados) >= 3:
-                break  # ya tenemos 3 resultados
+                break  
 
         return jsonify({"resultados": resultados})
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-
-
-
-
-# --------------------------
 # Funciones auxiliares
-# --------------------------
 def send_to_model(image: Image.Image):
     fmt = image.format or "PNG"
     ext = fmt.lower()
@@ -230,22 +171,6 @@ def send_to_model(image: Image.Image):
             os.remove(tmp_path)
 
 
-def get_med_info(predicted_name: str):
-    if not predicted_name or predicted_name.strip() == "":
-        return {"informacion": "Nombre no detectado"}
-
-    name = predicted_name.lower().strip()
-
-    # FAISS (similaridad por embeddings)
-    docs = vectorstore.similarity_search(name, k=1)
-    if docs:
-        best_match = docs[0].page_content.strip()
-        return meds.get(best_match, "Información no encontrada")
-
-    return "Información no encontrada"
-
-
-
 def clean_med_name(raw_name: str):
     if not raw_name:
         return "Nombre no detectado"
@@ -277,9 +202,7 @@ def clean_med_name(raw_name: str):
     return "Nombre no encontrado"
          
 
-# --------------------------
 # Ejecutar app
-# --------------------------
 if __name__ == '__main__':
     print("Servidor corriendo en http://0.0.0.0:8000")
     app.run(host='0.0.0.0', port=8000)
