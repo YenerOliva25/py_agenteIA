@@ -50,6 +50,9 @@ def predict_text():
     if not pregunta:
         return jsonify({"error": "No se envió pregunta"}), 400
 
+    if not es_palabra_valida(pregunta):
+        return jsonify({"error": "Palabra sin sentido"}), 400
+
     try:
         resultados = []
         nombres_agregados = set()
@@ -82,6 +85,16 @@ def predict_text():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+def es_palabra_valida(texto):
+    # Quitar espacios al inicio y fin
+    texto = texto.strip()
+    # No aceptar si tiene más de 3 letras iguales consecutivas
+    if re.search(r'(.)\1{3,}', texto):
+        return False
+    # Opcional: descartar si no tiene ninguna vocal
+    if not re.search(r'[aeiouáéíóú]', texto.lower()):
+        return False
+    return True
 
 # Endpoint archivo
 @app.route('/predict_file', methods=['POST'])
