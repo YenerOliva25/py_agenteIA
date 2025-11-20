@@ -1,3 +1,4 @@
+import traceback
 import base64
 import io
 import subprocess
@@ -20,7 +21,15 @@ from langchain.llms import HuggingFacePipeline
 
 from transformers import pipeline
 from difflib import get_close_matches
+import requests
 
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL_NAME = "llama3"
+NOMBRE_MODELO = "moondream"
+
+
+TMP_DIR = os.path.join(os.environ["USERPROFILE"], "tmp_ollama")
+os.makedirs(TMP_DIR, exist_ok=True)
 
 # Archivo con información de medicamentos
 MEDS_FILE = 'medicamentos.json'
@@ -42,6 +51,9 @@ app = Flask(__name__)
 # Endpoint texto
 @app.route('/predict_text', methods=['POST'])
 def predict_text():
+    import traceback
+    import json
+
     data = request.get_json()
     if not data:
         return jsonify({"error": "El cuerpo no es JSON"}), 400
@@ -50,40 +62,85 @@ def predict_text():
     if not pregunta:
         return jsonify({"error": "No se envió pregunta"}), 400
 
-    if not es_palabra_valida(pregunta):
-        return jsonify({"error": "Palabra sin sentido"}), 400
-
     try:
+        # --- 1. BUSCAR MEDICAMENTOS SIMILARES ---
         resultados = []
+        datoscontexto = []
         nombres_agregados = set()
 
         med_name = clean_med_name(pregunta)
-
-        # Buscar top 3 similares usando FAISS
-        docs = vectorstore.similarity_search(med_name, k=3)  
+        docs = vectorstore.similarity_search(med_name, k=1)
 
         for d in docs:
             nombre = d.page_content.strip()
             if nombre.lower() not in nombres_agregados and nombre in meds:
                 info = meds[nombre]
-                resultados.append({
+                datoscontexto.append({
                     "medication": nombre,
                     "informacion": info
                 })
                 nombres_agregados.add(nombre.lower())
-            if len(resultados) >= 3:
-                break
 
-        if not resultados:
-            resultados.append({
-                "medication": "No identificado",
-                "informacion": "No se encontró información relevante"
-            })
+        # --- 2. Construir contexto ---
+        if not datoscontexto:
+            contexto = "No se encontró información en la base de datos de medicamentos."
+        else:
+            contexto = "\n".join(
+                [f"- {r['medication']}: {r['informacion']}" for r in datoscontexto]
+            )
 
-        return jsonify({"resultados": resultados})
+        # --- 3. Preparar prompt para Ollama ---
+        prompt = f"""
+Eres un asistente experto en medicamentos.
+Responde en español de forma clara, precisa y útil.
+Solo usa la información proporcionada en el CONTEXTO. 
+No agregues información de fuera de la base de datos.
+
+PREGUNTA DEL USUARIO:
+{pregunta}
+
+CONTEXTO (información real de mi base de datos):
+{contexto}
+
+Instrucciones:
+- Responde en 2 o 3 frases como máximo.
+- Sé conciso y directo.
+- Coloca al final de tu respuesta la información encontrada en la base de datos anteponiendo la frase "BASE PROPIA:".
+- Si no encuentras algo para decir en el contexto, responde: "No hay información suficiente en la base de datos."
+"""
+
+        payload = {"model": MODEL_NAME, "prompt": prompt}
+
+        # --- 4. Llamada a Ollama ---
+        response = requests.post(OLLAMA_URL, json=payload, timeout=180)
+
+        # --- 5. Manejar streaming JSON ---
+        frase_completa = ""
+        lines = response.text.strip().splitlines()
+
+        for line in lines:
+            try:
+                data_line = json.loads(line)
+                if "response" in data_line:
+                    frase_completa += data_line["response"]
+            except json.JSONDecodeError:
+                continue  # ignorar líneas inválidas
+
+        frase_completa = frase_completa.strip()
+
+        # --- 6. Responder con JSON  ---
+        resultados.append({
+            "medication": nombre,
+            "informacion": frase_completa
+        })  
+
+        return jsonify({"resultados": resultados})      
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
 
 def es_palabra_valida(texto):
     # Quitar espacios al inicio y fin
@@ -149,39 +206,34 @@ def predict_file():
 
 # Funciones auxiliares
 def send_to_model(image: Image.Image):
-    fmt = image.format or "PNG"
-    ext = fmt.lower()
-    if ext == "jpeg":
-        ext = "jpg"
+    
 
-    tmp_path = os.path.join(tempfile.gettempdir(), f"tmp_ollama.{ext}")
-    image.save(tmp_path, format=fmt)
+    tmp_path = os.path.join(TMP_DIR, "tmp_ollama.png")
+    image.save(tmp_path, format="PNG")
+    print("Archivo guardado:", os.path.exists(tmp_path))
 
-    try:
-        prompt = f"""
-        Analiza la imagen ubicada en: {tmp_path}.
-        Idioma: español.
-        ❗ IMPORTANTE:
-        Devuelve SOLO el nombre del medicamento, SIN dosis, SIN texto adicional.
-        """
-        print(prompt)
-        result = subprocess.run(
-            ["ollama", "run", "moondream", prompt],
-            capture_output=True,
-            encoding="utf-8",
-            errors="ignore"
-        )
+    prompt_text = (
+        "Analiza la imagen ubicada en: "
+        f"{tmp_path}\n"
+        "Idioma: español.\n"
+        "❗ IMPORTANTE:\n"
+        "Devuelve SOLO el nombre del medicamento, SIN dosis, SIN texto adicional."
+    )
 
-        if result.returncode != 0:
-            raise RuntimeError(f"Error al ejecutar Ollama: {result.stderr}")
+    print("Prompt enviado a Ollama:\n", prompt_text)
 
-        text = result.stdout.strip()
-        print("Texto detectado por OCR:", text)
-        return text
+    result = subprocess.run(
+        ["ollama", "run", "moondream", prompt_text],
+        capture_output=True,
+        encoding="utf-8",
+        errors="ignore"
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Error al ejecutar Ollama: {result.stderr}")
 
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    text = result.stdout.strip()
+    print("Texto detectado por OCR:", text)
+    return text
 
 
 def clean_med_name(raw_name: str):
